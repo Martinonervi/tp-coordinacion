@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import zlib
 
 from common import middleware, message_protocol, fruit_item
 
@@ -97,12 +98,12 @@ class SumFilter:
         logging.info(f"Flushing client_id: {client_id}")
         client_fruits = self.amount_by_fruit.pop(client_id, {})
         for final_fruit_item in client_fruits.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [client_id, final_fruit_item.fruit, final_fruit_item.amount]
-                    )
-                )
+            this_fruit_aggregator = self.data_output_exchanges[
+                zlib.crc32(final_fruit_item.fruit.encode()) % AGGREGATION_AMOUNT
+            ]
+            this_fruit_aggregator.send(message_protocol.internal.serialize(
+                [client_id, final_fruit_item.fruit, final_fruit_item.amount])
+            )
 
         logging.info(f"Broadcasting EOF message for client_id: {client_id}")
         for data_output_exchange in self.data_output_exchanges:
