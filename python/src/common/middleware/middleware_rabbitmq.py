@@ -128,7 +128,9 @@ class RabbitMQChannel:
         try:
             if not self.consumer_tag:
                 return
-            self.channel.stop_consuming(self.consumer_tag)
+            self.connection.add_callback_threadsafe(
+                lambda: self.channel.stop_consuming(self.consumer_tag)
+            )
             self.consumer_tag = None
         except pika.exceptions.AMQPConnectionError as e:
             raise MessageMiddlewareDisconnectedError("Conexion failed, error") from e

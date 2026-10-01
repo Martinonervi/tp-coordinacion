@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 import zlib
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -19,6 +20,7 @@ class SumFilter:
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, INPUT_QUEUE
         )
+
         self.data_output_exchanges = []
         for i in range(AGGREGATION_AMOUNT):
             data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
@@ -26,12 +28,14 @@ class SumFilter:
             )
             self.data_output_exchanges.append(data_output_exchange)
 
-        self.sums_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE,
+        self.sum_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
             [f"{SUM_PREFIX}_{i}" for i in range(SUM_AMOUNT) if i != ID]
         )
-        self.sums_input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE,
+        self.sum_input_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST,
+            SUM_CONTROL_EXCHANGE,
             [f"{SUM_PREFIX}_{ID}"]
         )
 
@@ -41,6 +45,15 @@ class SumFilter:
         self.total_count = {} #cantidad total de paquetes del cliente (viene con el EOF)
         self.global_count = {} #la cantidad de paquetes leidos por todos los sum (que este sum se entero)
         self.lock = threading.Lock()
+        self.sums_thread = None
+
+
+    # loop que corre el thread que se encarga de consumir mensajes de otros sums
+    def _start_sums_consumer(self):
+        try:
+            self.sum_input_exchange.start_consuming(self.process_sums_message)
+        finally:
+            self.sum_input_exchange.close()
 
     def process_sums_message(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
@@ -50,16 +63,48 @@ class SumFilter:
             self._process_count(*fields[1:])
         ack()
 
+    #mensaje que un sum recibe cuando a otro sum le llego el EOF de un cliente,
+    # es un aviso de que el cliente esta terminando (de mandar)
     def _process_close(self, client_id, total_count):
         logging.info(f"Received CLOSE for client_id: {client_id}, total_count: {total_count}")
         with self.lock:
+            #se guarda la cantidad total de mensajes que mando el cliente
             self.total_count[client_id] = total_count
+            #y le notifica a los demas sum lo que él (este sum) proceso del cliente
             self._notify_count(client_id, self.records_read.get(client_id, 0))
 
+    # msj que recibo de un sum donde me dice cuanto proceso de un cliente
     def _process_count(self, client_id, count):
         with self.lock:
             self.global_count[client_id] = self.global_count.get(client_id, 0) + count
             self._try_finish(client_id)
+
+    def _notify_count(self, client_id, count):
+        self.sum_output_exchange.send(
+            message_protocol.internal.serialize(["COUNT", client_id, count])
+        )
+        self.global_count[client_id] = self.global_count.get(client_id, 0) + count
+        self._try_finish(client_id)
+
+    #se fija si ya le puede mandar al aggregator, esto solo pasa si entre todos los
+    # sums procesaron el total de mensajes del cliente, que venia con el EOF
+    def _try_finish(self, client_id):
+        if self.global_count.get(client_id) != self.total_count.get(client_id):
+            return
+        logging.info(f"Flushing client_id: {client_id}")
+        client_fruits = self.amount_by_fruit.pop(client_id, {})
+        for final_fruit_item in client_fruits.values():
+            aggregator_index = zlib.crc32(f"{client_id}{final_fruit_item.fruit}".encode()) % AGGREGATION_AMOUNT
+            self.data_output_exchanges[aggregator_index].send(message_protocol.internal.serialize(
+                [client_id, final_fruit_item.fruit, final_fruit_item.amount])
+            )
+        logging.info(f"Broadcasting EOF message for client_id: {client_id}")
+        for data_output_exchange in self.data_output_exchanges:
+            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
+
+        self.records_read.pop(client_id, None)
+        self.total_count.pop(client_id, None)
+        self.global_count.pop(client_id, None)
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data for client_id: {client_id}")
@@ -71,7 +116,8 @@ class SumFilter:
             #guardo cuanto lei de ese cliente
             self.records_read[client_id] = self.records_read.get(client_id, 0) + 1
 
-            #si este cliente estaba terminando aviso que lei cosas nuevas
+            #si el EOF ya habia llegado, este cliente estaba terminando, por lo que
+            # le aviso a los otros sums que lei cosas nuevas
             if client_id in self.total_count:
                 self._notify_count(client_id, 1)
 
@@ -79,39 +125,12 @@ class SumFilter:
         logging.info(f"Received EOF for client_id: {client_id}, total_count: {total_count}")
         with self.lock:
             self.total_count[client_id] = total_count
-            self.sums_output_exchange.send(
+            #le aviso a todos los sums que estamos terminando con el cliente
+            self.sum_output_exchange.send(
                 message_protocol.internal.serialize(["CLOSE", client_id, total_count])
             )
+            #les mando a los otros sums cuanto procese del cliente
             self._notify_count(client_id, self.records_read.get(client_id, 0))
-
-    def _notify_count(self, client_id, count):
-        self.sums_output_exchange.send(
-            message_protocol.internal.serialize(["COUNT", client_id, count])
-        )
-        self.global_count[client_id] = self.global_count.get(client_id, 0) + count
-        logging.info(f"[DEBUG] notify client_id={client_id} +{count} -> global={self.global_count[client_id]} total={self.total_count.get(client_id)}")
-        self._try_finish(client_id)
-
-    def _try_finish(self, client_id):
-        if self.global_count.get(client_id) != self.total_count.get(client_id):
-            return
-        logging.info(f"Flushing client_id: {client_id}")
-        client_fruits = self.amount_by_fruit.pop(client_id, {})
-        for final_fruit_item in client_fruits.values():
-            this_fruit_aggregator = self.data_output_exchanges[
-                zlib.crc32(final_fruit_item.fruit.encode()) % AGGREGATION_AMOUNT
-            ]
-            this_fruit_aggregator.send(message_protocol.internal.serialize(
-                [client_id, final_fruit_item.fruit, final_fruit_item.amount])
-            )
-
-        logging.info(f"Broadcasting EOF message for client_id: {client_id}")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
-
-        self.records_read.pop(client_id, None)
-        self.total_count.pop(client_id, None)
-        self.global_count.pop(client_id, None)
 
     def process_data_messsage(self, message, ack, nack):
         fields = message_protocol.internal.deserialize(message)
@@ -123,13 +142,29 @@ class SumFilter:
 
 
     def start(self):
-        sums_thread = threading.Thread(
-            target=self.sums_input_exchange.start_consuming,
-            args=(self.process_sums_message,),
-            daemon=True,
+        signal.signal(signal.SIGTERM, self.handle_sigterm)
+        self.sums_thread = threading.Thread(
+            target=self._start_sums_consumer
         )
-        sums_thread.start()
-        self.input_queue.start_consuming(self.process_data_messsage)
+        try:
+            self.sums_thread.start()
+            self.input_queue.start_consuming(self.process_data_messsage)
+        finally:
+            self.close()
+
+    def handle_sigterm(self, signum, frame):
+        logging.info("Recieved SIGTERM signal")
+        self.input_queue.stop_consuming()
+        self.sum_input_exchange.stop_consuming()
+
+    def close(self):
+        self.input_queue.stop_consuming()
+        self.sums_thread.join()
+
+        self.input_queue.close()
+        self.sum_output_exchange.close()
+        for data_output_exchange in self.data_output_exchanges:
+            data_output_exchange.close()
 
 def main():
     logging.basicConfig(level=logging.INFO)
