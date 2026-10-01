@@ -159,6 +159,7 @@ class SumFilter:
 
     def close(self):
         self.input_queue.stop_consuming()
+        self.sum_input_exchange.stop_consuming()
         self.sums_thread.join()
 
         self.input_queue.close()

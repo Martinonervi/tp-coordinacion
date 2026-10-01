@@ -37,8 +37,10 @@ class JoinFilter:
             ack()
             return
 
-        top_candidates.sort(key=lambda fruit_amount: fruit_amount[1], reverse=True)
-        fruit_top = top_candidates[:TOP_SIZE]
+        candidates = [fruit_item.FruitItem(fruit, amount) for fruit, amount in top_candidates]
+        best = sorted(candidates, reverse=True)[:TOP_SIZE]
+        fruit_top = [(item.fruit, item.amount) for item in best]
+
         self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
 
         self.partial_info_by_client.pop(client_id, None)
